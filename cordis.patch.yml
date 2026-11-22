@@ -1,0 +1,14 @@
+- insert:
+    - id: ask-every
+      name: 'dsh-ask-every'
+      config:
+        minQuestions: 3
+        maxQuestions: 6
+        reaskOnSkip: true
+        extraRules: ''
+        dimensions:
+          - "goal & scope — what exactly to make or do, and how far it must go"
+          - "audience & scenario — who will use the result, in what environment"
+          - "deliverable form — document / code / prototype / plan-only, and format requirements"
+          - "hard constraints — platform, tech stack, deadline, privacy, local-only musts"
+          - "edges & failure handling — what is explicitly out of scope, what to do when blocked"
