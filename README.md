@@ -35,15 +35,17 @@ dsh-ask-every 安装后做两件事：
 
 ## 设计思路
 
-**三阶段闸门的编排逻辑。** 一次确认流程分三段收敛，每段只解决一件事：
+**五阶段覆盖的编排逻辑。** 一次确认流程分五段收敛，每段只解决一件事：
 
 | 阶段 | 收敛什么 | 形式 |
 |---|---|---|
-| 一 澄清 | 决策点：范围、交付形式、硬约束、边界 | 静默推断 → 重述 → 弹窗 1–6 问 |
-| 二 计划方向 | 方案：2–4 个编号方向供选择 | 聊天区列方案 + 弹窗选方向 |
-| 三 执行闸门 | 放行：一次显式确认 | 弹窗最后一问固定为 `execute_gate` |
+| 0 任务分解 | 范围：子任务清单 | 首弹窗第一问确认"要做的有这几件" |
+| 1 结构化澄清 | 决策点：任务类型模板的必问项 + 补充维度 | 弹窗 1–10 问，允许一轮追问 |
+| 2 方案卡 | 方案：2–4 个五字段方向 | 聊天区完整卡片 + 弹窗选方向 |
+| 2.5 需求回放 | 理解一致性：事实/推断/未确认 | 并入闸门弹窗逐条确认 |
+| 3 执行闸门 | 放行：一次显式确认 | 弹窗最后一问固定为 `execute_gate` |
 
-闸门问题固定 id、固定位置、固定选项，是整个流程的锚点：跳过不算数、超时不算数、修改变体都收口回同一个问题。
+闸门问题固定 id、固定位置、固定选项，是整个流程的锚点：跳过不算数、超时不算数、修改变体都收口回同一个问题。**覆盖不靠问题数量，靠机制**：分解防漏项、模板保证必问面、回放让偏差在执行前暴露。
 
 **为什么要两层。** 提示词层擅长编排——什么时候问、问什么、怎么把你的粗略答案折进方案，这些交给模型判断比写死逻辑好。但提示词层不擅长强制——模型对"不许执行"的理解是概率性的。所以凡是"必须不发生"的事，交给引擎层的 `ctx.tools.guard()`：它同步执行、与监听器顺序无关、只认闸门答案里的点击，模型无论怎么被上下文带偏都绕不开一次真实点击。参照实现是 DSH 官方的 plan-mode（同样的 projection + guard 机制），API 均为官方公开接口。
 
@@ -153,7 +155,7 @@ npm test   # node --test tests/
 
 # English
 
-> **Clarify by popup first → present plan options to select → run the task only after one confirming click** — enforced by the engine, not by the model's good behavior.
+> **Decompose → clarify → plan cards → playback → one confirming click** — enforced by the engine, not by the model's good behavior.
 
 A persistent plugin for [DeepSeek Harness (DSH)](https://github.com/deepseek-ai/deepseek-harness) that turns every task-like message into a controlled confirmation flow: **if the popup is not confirmed by a click, background work does not run.**
 
@@ -161,34 +163,42 @@ A persistent plugin for [DeepSeek Harness (DSH)](https://github.com/deepseek-ai/
 
 After installation it does two things:
 
-1. **Injects a standing protocol** into the system prompt: every task-like message goes through three fixed stages — clarification popup → plan-direction checklist popup → execute-gate popup.
+1. **Injects a standing protocol** into the system prompt: every task-like message goes through a fixed coverage flow — task decomposition → structured clarification (task-type templates) → plan cards → requirement playback → execute-gate popup.
 2. **Registers an engine-level tool guard** (on by default since v2.0) that denies every tool call outside a small allowlist until the gate passes — no writes, no shell, no subagent dispatch.
 
-The two layers split the work: the protocol decides *what to ask, how to frame options, and how to present the gate* (model judgment); the guard makes *no-go actually mean no-go* (mechanism, order-independent, unbypassable).
+The two layers split the work: the protocol decides *what to ask, how to frame options, and how to present the gate* (model judgment); the guard makes *no-go actually mean no-go* (mechanism, order-independent, unbypassable). Since v2.1 the protocol is coverage-first: decomposition catches missing subtasks, task-type templates guarantee the required decisions get asked, and playback exposes misreadings before execution.
 
 ## Problems it solves
 
-**Vague requests getting answered instead of understood.** Say "optimize this script" and a model may charge ahead and deliver the wrong thing. This plugin forces the agent to clarify first — 1–6 targeted popup questions per message, then 2–4 numbered plan directions you choose from. Rough answers are folded in as directional signals, not re-interrogated point by point.
+**Vague requests getting answered instead of understood.** Say "optimize this script" and a model may charge ahead and deliver the wrong thing. This plugin forces the agent to clarify first — confirm the subtask list, ask the task-type template's required items (for code: acceptance criteria, editable scope, boundaries), allow one follow-up round, then present 2–4 five-field plan cards. Rough answers are folded in as directional signals, not re-interrogated point by point.
+
+**Requirements getting misread.** No set of questions catches everything. Before execution the agent replays "what you stated / what it inferred / what is still open and how it will default" for you to confirm or correct — misreadings surface at this checkpoint instead of after rework.
 
 **Backend work running without your confirmation.** Prompt-only "ask first" instructions are fragile: strong context can wash them away. The v2.0 guard turns the constraint into mechanism — in a locked session, calls like `pwsh`, `write`, or subagent dispatch are denied by the engine with a "present the checklist first" failure until you click 「满足，开始执行」.
 
-**Who it is for:** people who describe needs roughly and want the agent made to understand first; people burned by "the AI went off and did things"; anyone who wants an auditable confirmation step — every release is an explicit click, every denial is recorded as a tool result.
+**Who it is for:** people who describe needs roughly and want the agent made to understand first; people burned by plans that drifted and forced rework; people burned by "the AI went off and did things"; anyone who wants an auditable confirmation step — every release is an explicit click, every denial is recorded as a tool result.
 
 ## Design
 
-**Three stages, one decision each.** Stage 1 converges decision points (silent analysis → restatement → 1–6 questions). Stage 2 converges the plan (2–4 numbered directions, popup selection). Stage 3 converges permission (the LAST popup question is always the fixed id `execute_gate`). The gate question has a fixed id, position, and options — skips and timeouts never count, every revision path funnels back to the same question.
+**Five stages, one decision each.** Stage 0 converges scope (confirm the subtask list). Stage 1 converges decision points (task-type template items, 1–10 questions, one optional follow-up round). Stage 2 converges the plan (2–4 five-field plan cards). Stage 2.5 converges understanding (facts / inferences / open items replay). Stage 3 converges permission (the LAST popup question is always the fixed id `execute_gate`). The gate question has a fixed id, position, and options — skips and timeouts never count, every revision path funnels back to the same question. **Coverage does not come from question count**: decomposition prevents missing subtasks, templates guarantee the required decisions, playback exposes drift before execution.
 
 **Why two layers.** Prompt-layer is good at orchestration — when to ask, what to ask, how to fold rough answers in. It is bad at enforcement — its "don't execute" is probabilistic. Anything that *must not happen* is delegated to the engine's `ctx.tools.guard()`: synchronous, order-independent, unlocked only by a real click in the gate answer. The reference implementation is DSH's official plan-mode (same projection + guard machinery), all through public plugin APIs.
 
 **Fail-closed by choice.** State derives from live session events: every real user message re-locks; only a gate click opens. Skipped/timed-out popups stay closed; restarts stay closed; typed "go ahead" does not open the gate — the protocol converts it into one final gate click. A false lock costs one extra popup; a false release could cost much more. Subagent sessions are exempted mechanically by session origin, not by model memory.
 
-## Workflow (three-stage gate)
+## Workflow (coverage flow → execute gate)
 
-**Stage 1 — Clarify.** Silent intent analysis, restatement, 1–6 targeted popup questions (recommended options first, tradeoff descriptions). Analysis before the gate is read-only — writes, shell, subagent dispatch all wait.
+**Stage 0 — Task decomposition.** Split the message into a numbered subtask list and confirm it as the first popup question (all correct / missing items / misread) — so several jobs inside one sentence are not silently dropped.
 
-**Stage 2 — Plan-direction checklist.** 2–4 numbered directions (goal / outline / tradeoff) presented in chat, selected via popup.
+**Stage 1 — Structured clarification.** Identify the task type (code / doc / research / data / ops), ask the template's required items, up to 10 questions, then at most one follow-up round of 2–4 questions if the answers exposed new decision points.
 
-**Stage 3 — Execute gate.** The LAST question, id `execute_gate`: *"Does this plan satisfy your need? May I start?"* with options 满足，开始执行 / 需要修改 / 还有遗漏. Only an explicit go starts the work; a skipped or timed-out popup is not permission (the protocol outranks the host tool's "do not re-ask" wording and re-presents once, more simply). "Don't ask, just do it" is honored via a minimal one-question gate click.
+**Stage 2 — Plan cards.** 2–4 directions, each with five fields: goal / key steps / deliverable / key assumption / risk and fallback. Full cards in chat, short-form options in the popup.
+
+**Stage 2.5 — Requirement playback.** Replay facts (≤8), inferences marked [推断] (≤5), and open items with defaults (≤3) for one confirmation or per-line correction.
+
+**Stage 3 — Execute gate.** The LAST question, id `execute_gate`: *"这些方向是否满足你的需求？是否开始执行任务？"* with options 满足，开始执行 / 需要修改 / 还有遗漏. Only an explicit go starts the work; a skipped or timed-out popup is not permission (the protocol outranks the host tool's "do not re-ask" wording and re-presents once, more simply). "Don't ask, just do it" is honored via a minimal one-question gate click.
+
+**Three modes:** `lite` restores the old behavior (five generic dimensions, 1–6 questions, no decomposition or playback); `standard` (default) is the full flow above; `deep` runs two follow-up rounds and splits playback into its own popup.
 
 **Quiet by default:** small talk, confirmations, and meta questions never trigger; subagents, team workers, scheduled tasks, and goal continuations are exempt.
 
@@ -211,12 +221,13 @@ Or paste the repo directory under **Plugins → Add plugin**. Requires DSH ≥ 0
 
 ## Configuration
 
-Same schema as the Chinese table above, all keys live in the `ask-every` row of `cordis.patch.yml`: question range (`minQuestions`/`maxQuestions`), `reaskOnSkip`, `dimensions`, `extraRules`, gate text (`gateQuestionId`/`gateQuestion`/`gateGoOption`/`gateReviseOption`/`gateAddOption`), and gate behavior (`hardGate`, `preGateTools`, `exemptOrigins`, `gateGoMarkers`). Invalid config fails at activation instead of being ignored.
+Same schema as the Chinese table above, all keys live in the `ask-every` row of `cordis.patch.yml`: mode presets (`mode`, `decomposeFirst`, `taskTemplates`, `clarifyRounds`, `playback`), question range (`minQuestions`/`maxQuestions`), `reaskOnSkip`, `dimensions`, `extraRules`, gate text (`gateQuestionId`/`gateQuestion`/`gateGoOption`/`gateReviseOption`/`gateAddOption`), and gate behavior (`hardGate`, `preGateTools`, `exemptOrigins`, `gateGoMarkers`). Invalid config fails at activation instead of being ignored.
 
 ## Known limits
 
 - The prompt layer orchestrates (what to ask, how to present); the engine layer only enforces the gate.
 - Gate state is a live derivation of the session event log: after a restart the session re-locks fail-closed and the agent re-presents the gate once.
+- Template coverage is probabilistic: a wrongly identified task type can still ask the wrong questions; playback is the backstop, and it is itself bounded (facts ≤8, inferences ≤5, open items ≤3).
 - Unattended scheduled/goal sessions stall on the gate by design — disable `hardGate` for unattended flows.
 
 ## Development
