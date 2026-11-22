@@ -32,6 +32,13 @@ test('resolveConfig rejects unknown keys', () => {
   assert.throws(() => resolveConfig({ nope: 1 }), /unknown key/)
 })
 
+test('resolveConfig accepts an explicitly empty extraRules (patch-file default)', () => {
+  // cordis.patch.yml ships extraRules: '' — that must activate cleanly.
+  const c = resolveConfig({ extraRules: '' })
+  assert.equal(c.extraRules, '')
+  assert.throws(() => resolveConfig({ extraRules: 0 }), /must be a string/)
+})
+
 test('resolveConfig rejects wrong types', () => {
   assert.throws(() => resolveConfig({ minQuestions: 'x' }), /must be an integer/)
   assert.throws(() => resolveConfig({ reaskOnSkip: 'yes' }), /must be a boolean/)

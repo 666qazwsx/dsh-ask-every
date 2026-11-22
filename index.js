@@ -74,7 +74,11 @@ export function resolveConfig(config = {}) {
   c.minQuestions = clampInt(c.minQuestions, 1, 1, 10, 'minQuestions')
   c.maxQuestions = clampInt(c.maxQuestions, 6, c.minQuestions, 10, 'maxQuestions')
   c.reaskOnSkip = boolOr(c.reaskOnSkip, true, 'reaskOnSkip')
-  c.extraRules = stringOr(c.extraRules, '', 'extraRules')
+  // extraRules may legitimately be empty (the default) — only its type is checked.
+  if (c.extraRules === undefined) c.extraRules = ''
+  else if (typeof c.extraRules !== 'string') {
+    throw new Error(`ask-every config extraRules must be a string, got ${JSON.stringify(c.extraRules)}`)
+  }
   c.dimensions = stringArrayOr(c.dimensions, DEFAULT_DIMENSIONS, 'dimensions', true)
   c.gateQuestionId = stringOr(c.gateQuestionId, DEFAULT_GATE_QUESTION_ID, 'gateQuestionId')
   c.gateQuestion = stringOr(c.gateQuestion, '这份计划方向清单是否满足你的需求？是否开始执行任务？', 'gateQuestion')
