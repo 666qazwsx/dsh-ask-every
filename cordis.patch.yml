@@ -2,10 +2,11 @@
     - id: ask-every
       name: 'dsh-ask-every'
       config:
-        minQuestions: 3
+        minQuestions: 1
         maxQuestions: 6
         reaskOnSkip: true
         extraRules: ''
+        gateQuestionId: execute_gate
         dimensions:
           - "goal & scope — what exactly to make or do, and how far it must go"
           - "audience & scenario — who will use the result, in what environment"
