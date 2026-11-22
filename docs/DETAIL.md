@@ -1,6 +1,6 @@
 # Ask-every clarification protocol
 
-在 base-backed profile 的每个会话中注入一条常驻系统提示词协议（section 名 `ask-every-protocol`，order 10400）。协议要求主对话代理按固定三阶段闸门处理任务类消息：
+在 base-backed profile 的每个会话中注入一条常驻系统提示词协议（section 名 `ask-every-protocol`，order 10400），并（自 v2.0 起）注册一个引擎级工具 guard 执行门控。协议要求主对话代理按固定三阶段闸门处理任务类消息：
 
 **阶段一：澄清。** 先安静分析并像资深专业人士那样推断真实意图，用一两句话重述理解，然后调用 `ask_user_question` 提出 1–6 个针对真实决策点的问题（含推荐选项、权衡说明）。澄清阶段的模型分析只允许只读操作；写入、shell、派发子代理等一律等闸门通过。你的粗略回答会被当作方向性信号折进方案，不会被逐点追问。
 
@@ -12,7 +12,16 @@
 - 修改轮次超过 3 轮后，只聚焦剩余分歧点（至多 3 问），不再整单重列；
 - 只有明确选择「满足，开始执行」任务才启动；跳过/超时不作数——协议显式声明优先于宿主工具说明中"跳过的问题不再重问"的字面规则，会简化后重发一次，连续两次跳过视为用户离开，停下等待明确放行。
 
-子代理、团队任务执行者、定时任务消息、goal 自动续跑不受协议约束。闲聊、确认续行、元问题不触发弹窗。用户随时可以说"别问了/你定吧"跳过当前任务。
+子代理、团队任务执行者、定时任务消息、goal 自动续跑不受协议约束。闲聊、确认续行、元问题不触发弹窗。用户随时可以说"别问了/你定吧"跳过当前任务（硬门控下会转成一个单问弹窗的点击放行）。
+
+## 引擎级硬门控（v2.0，默认开启，`hardGate: false` 可关）
+
+- 会话默认上锁，每条真实用户消息重新上锁；`ask_user_question` 闸门（id `execute_gate`）点选「满足，开始执行」才开锁。
+- 上锁期间 `ctx.tools.guard()` 拒绝白名单外的全部工具调用，拒绝原因引导模型重新弹清单；guard 同步且顺序无关，模型无法通过监听器顺序绕过。
+- 白名单默认 `ask_user_question`、`read`、`glob`、`grep`、`web_search`、`web_fetch`、`todo_write`（`preGateTools` 可配，`ask_user_question` 永远保留）。
+- 自由输入文字不开锁；需要用户在闸门弹窗上点击。跳过/超时/重启均保持上锁（fail-closed）。
+- 子代理会话（origin `subagent`）与无代理调用豁免（`exemptOrigins` 可配）。
+- 定时任务、goal 续跑的会话同样会被上锁等待点击；无人值守场景请关闭 `hardGate`。
 
 ## 配置（cordis.patch.yml 的 `ask-every` 行）
 
@@ -25,15 +34,20 @@
 | `reaskOnSkip` | `true` | 弹窗被跳过/超时视为未放行，简化后重发一次；改 `false` 则转为"声明假设后继续" |
 | `dimensions` | plan-first 五类 | 阶段一追问维度清单（goal/scope、audience/scenario、deliverable form、hard constraints、edges/failure），数组，可增删改写成任意语言 |
 | `extraRules` | `''` | 追加到协议末尾的自定义规则文本 |
-| `gateQuestionId` | `execute_gate` | 闸门问题的固定 id |
+| `gateQuestionId` | `execute_gate` | 闸门问题的固定 id，引擎据此识别放行 |
 | `gateQuestion` | 中文默认句 | 闸门问题全文 |
 | `gateGoOption` | `满足，开始执行` | 闸门"放行"选项文本 |
 | `gateReviseOption` | `需要修改（…）` | 闸门"修改"选项文本 |
 | `gateAddOption` | `还有遗漏，…` | 闸门"补充"选项文本 |
+| `hardGate` | `true` | 引擎级门控开关；`false` 退回纯提示词模式 |
+| `preGateTools` | 只读白名单 | 门控未放行时仍允许的工具名列表 |
+| `exemptOrigins` | `['subagent']` | 豁免门控的会话 origin 列表 |
+| `gateGoMarkers` | 英文兜底标记 | 额外认可的放行选项关键词 |
 
 ## 已知边界
 
-- 提示词层约束：协议靠模型遵循系统提示词来生效，不是引擎级硬闸；极端情况下模型仍可能直接作答。闸门 id 约定、只读分析白名单条款、跳过重发优先级条款已尽量收紧这一边界。
+- 门控状态由会话事件流（`session/event` 的真实用户消息、`tools/result` 的闸门放行答案）实时派生，是日志的派生缓存：插件重载或应用重启后 fail-closed 重新上锁，代理会再弹一次闸门。
+- 提示词层仍负责流程编排（问什么、方案怎么列、闸门怎么呈现）；引擎层只负责"没点放行就不放行"。
 - 对普通 DSH 会话生效（需安装后重启/新会话）。已存在的旧会话从下一条消息起同样生效。
 
 ## 卸载 / 回滚
