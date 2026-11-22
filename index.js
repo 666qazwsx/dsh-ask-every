@@ -2,18 +2,19 @@
  * dsh-ask-every — a standing system-prompt protocol that makes the primary
  * conversation agent clarify the user's real need through an ask_user_question
  * popup before executing any task, backed (since 2.0) by an engine-level
- * execution gate.
+ * execution gate and (since 2.1) by a structured coverage flow.
  *
  * Two layers cooperate:
  *
  * - The prompt layer contributes one ordered system-prompt section describing
- *   the three-stage flow (clarify → plan-direction checklist → execute gate).
+ *   the coverage flow: task decomposition → structured clarification (task-type
+ *   templates) → plan cards → requirement playback → execute gate.
  * - The gate layer registers a `ctx.tools.guard()` that DENIES every tool call
  *   outside the configured allowlist until the user has selected the go option
  *   on the fixed `execute_gate` question of an `ask_user_question` popup. The
  *   gate state is derived from live events (`session/event`, `tools/result`):
  *   each real user message re-locks the session; a gate answer re-opens it.
- *   Subagent-lite sessions (origin `subagent`) and agentless calls are exempt.
+ *   Subagent sessions (origin `subagent`) and agentless calls are exempt.
  *
  * The gate is fail-closed: after a restart the session stays locked until the
  * agent re-presents the gate popup and the user clicks go again.
@@ -24,7 +25,7 @@
 /** The services this plugin needs: prompt registry, tool guard, session events. */
 export const inject = ['systemPrompt', 'tools', 'sessions']
 
-/** Default clarification dimensions scanned in Stage 1 (plan-first five). */
+/** Default clarification dimensions scanned in lite mode (plan-first five). */
 export const DEFAULT_DIMENSIONS = [
   'goal & scope — what exactly to make or do, and how far it must go',
   'audience & scenario — who will use the result, in what environment',
@@ -32,6 +33,80 @@ export const DEFAULT_DIMENSIONS = [
   'hard constraints — platform, tech stack, deadline, privacy, local-only musts',
   'edges & failure handling — what is explicitly out of scope, what to do when blocked',
 ]
+
+/**
+ * Default task-type templates: the required coverage items per task type.
+ * These turn "ask a few questions" into "cover the decisions this task type
+ * always has".
+ */
+export const DEFAULT_TASK_TEMPLATES = {
+  code: {
+    label: '代码开发',
+    fields: [
+      '语言、框架与版本',
+      '现有代码库位置与可改动范围',
+      '验收标准（测试/构建/行为）',
+      '运行环境与部署方式',
+      '边界与兼容性要求',
+      '是否允许改动现有行为',
+    ],
+  },
+  doc: {
+    label: '文档写作',
+    fields: [
+      '受众与使用场景',
+      '篇幅与结构',
+      '语气风格',
+      '引用与事实来源',
+      '交付格式',
+      '已有素材',
+    ],
+  },
+  research: {
+    label: '调研分析',
+    fields: [
+      '问题边界（含/不含）',
+      '信息源与时效要求',
+      '分析深度',
+      '输出形式',
+      '可信度与引用标准',
+    ],
+  },
+  data: {
+    label: '数据/表格',
+    fields: [
+      '数据源与获取方式',
+      '口径与字段定义',
+      '时间与范围粒度',
+      '输出粒度',
+      '校验方式',
+      '敏感数据处理',
+    ],
+  },
+  ops: {
+    label: '运营/方案',
+    fields: [
+      '目标指标',
+      '预算与资源',
+      '时间线',
+      '目标受众',
+      '硬约束',
+      '成功判定标准',
+    ],
+  },
+}
+
+/**
+ * Mode presets. Explicit per-field config overrides the preset value.
+ * - lite: previous behavior — five generic dimensions, no decomposition/playback.
+ * - standard: coverage flow with templates, one follow-up round, playback in the gate.
+ * - deep: two follow-up rounds and a separate playback popup.
+ */
+export const MODE_PRESETS = {
+  lite: { decomposeFirst: false, clarifyRounds: 0, playback: 'off', useTemplates: false, maxQuestions: 6 },
+  standard: { decomposeFirst: true, clarifyRounds: 1, playback: 'gate', useTemplates: true, maxQuestions: 10 },
+  deep: { decomposeFirst: true, clarifyRounds: 2, playback: 'separate', useTemplates: true, maxQuestions: 10 },
+}
 
 /** The fixed id of the plan-checklist gate question. */
 export const DEFAULT_GATE_QUESTION_ID = 'execute_gate'
@@ -66,13 +141,17 @@ export function resolveConfig(config = {}) {
     'minQuestions', 'maxQuestions', 'reaskOnSkip', 'dimensions', 'extraRules',
     'gateQuestionId', 'gateQuestion', 'gateGoOption', 'gateReviseOption', 'gateAddOption',
     'hardGate', 'preGateTools', 'exemptOrigins', 'gateGoMarkers',
+    'mode', 'decomposeFirst', 'taskTemplates', 'clarifyRounds', 'playback',
   ]
   const unknown = Object.keys(c).filter(key => !known.includes(key))
   if (unknown.length > 0) {
     throw new Error(`ask-every config has unknown key(s) ${unknown.join(', ')}`)
   }
-  c.minQuestions = clampInt(c.minQuestions, 1, 1, 10, 'minQuestions')
-  c.maxQuestions = clampInt(c.maxQuestions, 6, c.minQuestions, 10, 'maxQuestions')
+  c.mode = enumOr(c.mode, 'standard', ['lite', 'standard', 'deep'], 'mode')
+  const preset = MODE_PRESETS[c.mode]
+  c.maxQuestions = c.maxQuestions === undefined ? preset.maxQuestions : c.maxQuestions
+  c.minQuestions = clampInt(c.minQuestions, 1, 1, 12, 'minQuestions')
+  c.maxQuestions = clampInt(c.maxQuestions, preset.maxQuestions, c.minQuestions, 12, 'maxQuestions')
   c.reaskOnSkip = boolOr(c.reaskOnSkip, true, 'reaskOnSkip')
   // extraRules may legitimately be empty (the default) — only its type is checked.
   if (c.extraRules === undefined) c.extraRules = ''
@@ -81,7 +160,7 @@ export function resolveConfig(config = {}) {
   }
   c.dimensions = stringArrayOr(c.dimensions, DEFAULT_DIMENSIONS, 'dimensions', true)
   c.gateQuestionId = stringOr(c.gateQuestionId, DEFAULT_GATE_QUESTION_ID, 'gateQuestionId')
-  c.gateQuestion = stringOr(c.gateQuestion, '这份计划方向清单是否满足你的需求？是否开始执行任务？', 'gateQuestion')
+  c.gateQuestion = stringOr(c.gateQuestion, '这些方向是否满足你的需求？是否开始执行任务？', 'gateQuestion')
   c.gateGoOption = stringOr(c.gateGoOption, '满足，开始执行', 'gateGoOption')
   c.gateReviseOption = stringOr(c.gateReviseOption, '需要修改（在自定义输入里说明改哪里）', 'gateReviseOption')
   c.gateAddOption = stringOr(c.gateAddOption, '还有遗漏，我要补充需求（自由输入）', 'gateAddOption')
@@ -93,6 +172,12 @@ export function resolveConfig(config = {}) {
   }
   c.exemptOrigins = stringArrayOr(c.exemptOrigins, DEFAULT_EXEMPT_ORIGINS, 'exemptOrigins', false)
   c.gateGoMarkers = stringArrayOr(c.gateGoMarkers, DEFAULT_GATE_GO_MARKERS, 'gateGoMarkers', false)
+  c.decomposeFirst = boolOr(c.decomposeFirst, preset.decomposeFirst, 'decomposeFirst')
+  c.clarifyRounds = clampInt(c.clarifyRounds, preset.clarifyRounds, 0, 3, 'clarifyRounds')
+  c.playback = enumOr(c.playback, preset.playback, ['gate', 'separate', 'off'], 'playback')
+  c.taskTemplates = taskTemplatesOr(c.taskTemplates, DEFAULT_TASK_TEMPLATES)
+  // Internal flag, not user-facing: lite mode keeps the legacy dimension list.
+  c.useTemplates = preset.useTemplates
   return c
 }
 
@@ -108,6 +193,14 @@ function boolOr(value, fallback, name) {
   if (value === undefined) return fallback
   if (typeof value !== 'boolean') {
     throw new Error(`ask-every config ${name} must be a boolean, got ${JSON.stringify(value)}`)
+  }
+  return value
+}
+
+function enumOr(value, fallback, allowed, name) {
+  if (value === undefined) return fallback
+  if (!allowed.includes(value)) {
+    throw new Error(`ask-every config ${name} must be one of ${allowed.join(' / ')}, got ${JSON.stringify(value)}`)
   }
   return value
 }
@@ -129,6 +222,32 @@ function stringArrayOr(value, fallback, name, nonEmpty) {
     throw new Error(`ask-every config ${name} must not be empty`)
   }
   return value
+}
+
+function taskTemplatesOr(value, fallback) {
+  if (value === undefined) return fallback
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('ask-every config taskTemplates must be an object keyed by task type')
+  }
+  const out = {}
+  for (const [type, template] of Object.entries(value)) {
+    if (template === null || typeof template !== 'object') {
+      throw new Error(`ask-every config taskTemplates.${type} must be an object with label and fields`)
+    }
+    const label = template.label
+    if (typeof label !== 'string' || label.trim() === '') {
+      throw new Error(`ask-every config taskTemplates.${type}.label must be a non-empty string`)
+    }
+    const fields = template.fields
+    if (!Array.isArray(fields) || fields.length === 0 || fields.some(f => typeof f !== 'string' || f.trim() === '')) {
+      throw new Error(`ask-every config taskTemplates.${type}.fields must be a non-empty array of non-empty strings`)
+    }
+    out[type] = { label, fields: [...fields] }
+  }
+  if (Object.keys(out).length === 0) {
+    throw new Error('ask-every config taskTemplates must not be empty')
+  }
+  return out
 }
 
 /**
@@ -197,7 +316,7 @@ function installExecutionGate(ctx, c) {
 
   function gateDenial(execName) {
     return `Execution gate not passed (ask-every): this session denies "${execName}" until the user `
-      + `confirms the plan checklist. Present (or re-present) the plan-direction checklist via `
+      + `confirms the plan checklist. Present (or re-present) the plan cards via `
       + `ask_user_question whose LAST question has id "${c.gateQuestionId}" and offers the go option `
       + `"${c.gateGoOption}"; the gate opens only when the user selects it. While the gate is closed `
       + `you may only call: ${c.preGateTools.join(', ')}. This denial is policy, not a tool failure — `
@@ -241,19 +360,117 @@ function kind(result) {
   return result.isError === true ? 'failure' : 'success'
 }
 
+/** Render the task-type template table for the protocol text. */
+function renderTemplates(templates) {
+  return Object.entries(templates)
+    .map(([type, template]) => {
+      const fields = template.fields.map((f, i) => `     ${i + 1}. ${f}`).join('\n')
+      return `- \`${type}\` ${template.label}:\n${fields}`
+    })
+    .join('\n')
+}
+
+/** Render the coverage-flow stages (Stage 0/1/2/2.5) from the resolved config. */
+function buildCoverageFlow(c) {
+  const decomposeStage = c.decomposeFirst ? `
+### Stage 0 — Task decomposition
+
+Before anything else, split the user's message into a numbered list of concrete subtasks (verb-first, each independently verifiable). The FIRST question of your first popup is a decomposition check:
+
+- Question: "我理解你要做的事情是：1. … 2. … 这些理解对吗？" with options "全对，按这个范围来"(Recommended) / "有遗漏，我补充" / "有理解偏差，我纠正".
+- If the user corrects it, restate the corrected list once, then continue. Do not loop the decomposition popup.
+- A single-subtask message still passes this question once; the "全对" option makes it one click.
+` : ''
+
+  const clarifyStage = c.useTemplates ? `
+### Stage 1 — Structured clarification
+
+1. **Identify the task type(s)** from the template library below (multi-select when a task spans types).
+2. **Ask the template's required items** as popup questions — one decision point per question, recommended options first. The template items are required coverage: do not silently skip one; if an item is genuinely irrelevant, say so inside the question text.
+3. Ask between ${c.minQuestions} and ${c.maxQuestions} questions per popup. If fewer real decision points remain, asking fewer is allowed down to ${c.minQuestions}.
+4. **Follow-up round.** After the answers, check for NEW decision points the answers exposed. If any, run up to ${c.clarifyRounds} follow-up round(s) of 2-4 targeted questions. If none, proceed without one.
+5. User answers may be rough: treat them as directional signals and fold them in.
+
+Task-type templates (required coverage):
+
+${renderTemplates(c.taskTemplates)}
+
+Supplementary scan list (use only when it adds a dimension the templates missed):
+
+${c.dimensions.map((d, i) => `${i + 1}. ${d}`).join('\n')}
+` : `
+### Stage 1 — Understand and clarify
+
+1. **Think first, silently.** Reconstruct what the user actually wants; infer intent generously from the message, the conversation, and the workspace.
+2. **Restate.** Open with one or two sentences, in the user's language, restating what you believe the user wants.
+3. **Ask.** Call ask_user_question with between ${c.minQuestions} and ${c.maxQuestions} questions resolving the decision points you identified. One decision point per question; 2-5 concrete options each with a tradeoff; recommended option first; user's language.
+   - The user's answers may be rough: treat them as directional signals (fewer real decision points → ask fewer, down to ${c.minQuestions}).
+
+Clarification dimensions (scan these; cover the ones that materially affect this task):
+
+${c.dimensions.map((d, i) => `${i + 1}. ${d}`).join('\n')}
+`
+
+  const playbackBlock = c.playback === 'off' ? '' : c.playback === 'separate'
+    ? `
+### Stage 2.5 — Requirement playback (separate popup)
+
+Before the gate, replay your understanding as its own popup:
+
+- 事实: what the user actually stated (≤8 bullets).
+- 推断: your inferences, each marked [推断] (≤5 bullets).
+- 未确认: open items and the default you will take (≤3 bullets).
+
+Question: "执行前请确认我的理解" with options "全部正确，开始执行"(Recommended) / "有需要纠正的（自定义输入逐条改）". If corrected, replay once more, then continue to the gate.
+` : `
+### Stage 2.5 — Requirement playback (inside the gate popup)
+
+Before the gate question, add one playback question to the same popup:
+
+- 事实: what the user actually stated (≤8 bullets).
+- 推断: your inferences, each marked [推断] (≤5 bullets).
+- 未确认: open items and the default you will take (≤3 bullets).
+
+Question: "执行前请确认我的理解" with options "全部正确"(Recommended) / "有需要纠正的（自定义输入逐条改）". If corrected, replay once more, then ask the gate.
+`
+
+  const planCardStage = `
+### Stage 2 — Plan cards
+
+Draft 2-4 directions, each as a card with all five fields:
+
+- **目标**: one sentence.
+- **关键步骤**: 3-5 steps.
+- **产出物**: the concrete deliverable (files, outputs).
+- **关键假设**: the premise the direction rests on — and what changes if it is false.
+- **风险与回退**: main risk plus how to back out.
+
+Present the full cards in chat; the popup's direction options use the short form "name — one-line tradeoff", recommended first.
+
+**Popup the checklist.** Call ask_user_question with the direction choice first (single-select, recommended first, custom allowed) and the fixed gate LAST: id \`${c.gateQuestionId}\`, question "${c.gateQuestion}", options "${c.gateGoOption}"(Recommended) / "${c.gateReviseOption}" / "${c.gateAddOption}". Render the gate in the user's language when their language is not Chinese, keeping the go option recognizable as the start-now choice.
+`
+
+  return `${decomposeStage}${clarifyStage}${planCardStage}${playbackBlock}`
+}
+
 /** Render the standing protocol from the resolved config. */
 export function buildProtocol(c) {
-  const dimensionList = c.dimensions.map((d, i) => `${i + 1}. ${d}`).join('\n')
   const extra = String(c.extraRules || '').trim()
+  const flowTitle = c.useTemplates
+    ? 'Flow: Decompose → Structured clarify → Plan cards → Playback → Execute gate'
+    : 'Flow: Clarify → Plan-direction checklist → Execute gate'
+  const stageNames = c.useTemplates
+    ? 'all stages below, in order, on every applicable message.'
+    : 'all three stages, in order, on every applicable message.'
   const hardGateSection = c.hardGate ? `
 ## Engine-level execution gate (hard gate)
 
 A harness-level guard enforces the execute gate mechanically, not just by instruction:
 
 - Until the user selects "${c.gateGoOption}" on the gate question (id \`${c.gateQuestionId}\`), every tool call outside this allowlist is denied by the engine: ${c.preGateTools.join(', ')}.
-- A denial arrives as a failed tool result whose reason tells you to present the checklist. It is policy, not a tool error: never retry the denied call before the user clicks go.
+- A denial arrives as a failed tool result whose reason tells you to present the plan cards. It is policy, not a tool error: never retry the denied call before the user clicks go.
 - The session re-locks on each new user message, so a fresh task needs a fresh gate click.
-- A typed confirmation such as "go ahead" or "开始执行" does not open the gate by itself. When the user confirms in text, present the checklist popup one final time and let them convert it into the click; the engine opens only on that click.
+- A typed confirmation such as "go ahead" or "开始执行" does not open the gate by itself. When the user confirms in text, present the plan popup one final time and let them convert it into the click; the engine opens only on that click.
 - If ask_user_question is unavailable (for example a subagent session), you are exempt: proceed within the caller's already-confirmed scope.
 ` : ''
   return `# Need-clarification protocol (ask-every) — user-configured standing order
@@ -266,42 +483,21 @@ Every new user message that requests work — building, changing, analyzing, wri
 
 Do NOT trigger for: a reply or selection answering your earlier questions; a confirmation or continuation ("go ahead", "continue", "do it"); an explicit skip/off instruction; greetings or small talk; questions about how you work; messages delivered automatically (scheduled tasks, agent messages, goal rounds).
 
-## Flow: Clarify → Plan-direction checklist → Execute gate
+## Ground rules
 
-Follow all three stages, in order, on every applicable message.
+- **Analysis stays read-only.** While forming questions you may consult the conversation and workspace with read-only operations only. Do not start any mutating or side-effecting operation — no writes, no shell commands, no subagent dispatch, no scheduled or background job — until the execute gate below has passed.
+- **Coverage beats brevity.** The goal of every stage is coverage: nothing about the real need should stay an unstated assumption.
 
-### Stage 1 — Understand and clarify
+## ${flowTitle}
 
-1. **Think first, silently.** Before any visible answer, reconstruct what the user actually wants. Behave like a senior professional in the relevant domain: infer intent generously from the message, the conversation so far, and the workspace; form concrete, actionable hypotheses about the real need instead of merely noting that the request is vague.
-2. **Analysis stays read-only.** While forming your questions you may consult the conversation and workspace with read-only operations only. Do not start any mutating or side-effecting operation — no writes, no shell commands, no subagent dispatch, no scheduled or background job — until the execute gate below has passed.
-3. **Restate.** Open with one or two sentences, in the user's language, restating what you believe the user wants, including the hypotheses you inferred.
-4. **Ask.** Call ask_user_question with between ${c.minQuestions} and ${c.maxQuestions} questions resolving the decision points you identified. Question craft rules:
-   - One decision point per question. Every answer must be an actionable choice that changes the deliverable — never ceremony or padding. If fewer real decision points remain, ask fewer questions (down to ${c.minQuestions}).
-   - Give each question 2-5 concrete options, each with a one-sentence tradeoff or impact description. When you hold a professional opinion, place that option first and mark it "(Recommended)".
-   - Use multi_select where several answers can apply simultaneously.
-   - Write all questions, options, and descriptions in the user's language.
-   The user's answers may be rough or partial: treat them as directional signals and fold them into the plan rather than re-interrogating point by point.
+Follow ${stageNames}
+${buildCoverageFlow(c)}
+### Execute gate
 
-### Stage 2 — Plan-direction checklist (popup selection)
-
-5. **Draft directions.** From the answers, draft 2-4 distinct plan directions that could satisfy the confirmed need. Present them in chat as a numbered list; each direction gets: its goal in one sentence, a short outline of key steps, and its main tradeoff or consequence. When you hold a professional opinion, present that direction first and say why you recommend it.
-6. **Popup the checklist.** Call ask_user_question so the user selects instead of typing prose:
-   - The first question is the direction choice: single-select, options = the numbered directions with a one-line tradeoff description each (recommended one first), plus room for a custom answer.
-   - Optionally add one or two focused preference questions for details inside the chosen direction.
-   - **The LAST question is always the fixed gate**: id \`${c.gateQuestionId}\`, question "${c.gateQuestion}", with options "${c.gateGoOption}"(Recommended) / "${c.gateReviseOption}" / "${c.gateAddOption}". Render it in the user's language when their language is not Chinese, keeping the go option recognizable as the start-now choice.
-
-### Stage 3 — Execute gate
-
-7. **No execution before an explicit go.** The task starts only when the user selects "${c.gateGoOption}" on the gate question, or clearly confirms in text after the checklist was presented. You may not begin the actual work before that. ${c.reaskOnSkip ? 'A skipped or timed-out popup is NOT an answer and does not count as a go: re-present the checklist popup, more simply. A second consecutive skip means the user is away: stop and state that you will wait for their explicit go.' : 'A skipped or timed-out popup counts as "use your professional judgment": state assumptions and proceed.'}${c.hardGate ? ' With the hard gate enabled, a typed confirmation additionally needs its gate click: re-present the checklist popup so the user can convert their text into the selecting click, and only then begin.' : ''}
-8. **Modification loop.** If the user selects the revise option or supplies corrections: fold the feedback into the directions, present the revised numbered list, and popup the checklist again with the same fixed gate as its LAST question. If the user selects the add option, return to Stage 1 with sharper, more concrete questions covering only the new gaps. After 3 modification rounds, stop re-listing whole plans: consolidate the remaining open points into at most 3 focused questions.
-9. **After the go.** Output a compact confirmed-plan summary — chosen direction, the decisions taken, the assumptions you kept for anything the user did not answer — then immediately execute, using only the choices the user confirmed. Do not open popups again unless a new materially ambiguous decision point appears mid-task; handle minor choices yourself and note them.
+1. **No execution before an explicit go.** The task starts only when the user selects "${c.gateGoOption}" on the gate question, or clearly confirms in text after the plan was presented. You may not begin the actual work before that.${c.playback !== 'off' ? ' The playback question comes before the gate question in the same popup (or as its own popup in separate mode); a corrected playback must be replayed once before the gate.' : ''} ${c.reaskOnSkip ? 'A skipped or timed-out popup is NOT an answer and does not count as a go: re-present the popup, more simply. A second consecutive skip means the user is away: stop and state that you will wait for their explicit go.' : 'A skipped or timed-out popup counts as "use your professional judgment": state assumptions and proceed.'}${c.hardGate ? ' With the hard gate enabled, a typed confirmation additionally needs its gate click: re-present the popup so the user can convert their text into the selecting click, and only then begin.' : ''}
+2. **Modification loop.** If the user selects the revise option or supplies corrections: fold the feedback into the cards, present the revised list, and popup again with the same fixed gate as its LAST question. If the user selects the add option, return to the clarification stage with sharper questions covering only the new gaps. After 3 modification rounds, consolidate the remaining open points into at most 3 focused questions.
+3. **After the go.** Output a compact confirmed-plan summary — chosen direction, the decisions taken, the assumptions you kept for anything the user did not answer — then immediately execute, using only the choices the user confirmed. Do not open popups again unless a new materially ambiguous decision point appears mid-task; handle minor choices yourself and note them.
 ${hardGateSection}
-## Clarification dimensions (user-configured)
-
-Scan these when deciding what to ask in Stage 1; cover the ones that materially affect this task:
-
-${dimensionList}
-
 ## Off-ramps
 
 If the user says, in any language, "don't ask / you decide / skip the popups / direct forward", comply immediately for the current task${c.hardGate ? ' by presenting a minimal one-question gate popup ("跳过本次询问，直接按你的判断执行？") whose go click opens the gate; state your working assumptions alongside it' : ' and state your working assumptions instead of asking'}. If the user asks to disable this behavior permanently, tell them the row is \`ask-every\` (package \`dsh-ask-every\`) and it can be disabled or removed in the Plugins panel (or set \`hardGate: false\` for a prompt-only mode), then proceed with that task without asking. Never argue for the protocol's own use.${extra ? `\n\n## Extra rules (user-configured)\n\n${extra}` : ''}`

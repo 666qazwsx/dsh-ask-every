@@ -1,7 +1,7 @@
 {
   "meta": {
     "title": "Ask-every clarification protocol",
-    "description": "Three-stage gate plus an engine-level hard gate: (1) restating and clarifying the need through an ask_user_question popup, (2) presenting a numbered plan-direction checklist selected via popup, and (3) a fixed final gate question — does this satisfy your need, may I execute — before any work starts. The hard gate (on by default) is a tool guard that denies every non-allowlisted tool call until the user clicks go; sessions stay locked across restarts. Tunable via the ask-every row config, including hardGate: false for prompt-only mode.",
+    "description": "Coverage-first clarification plus an engine-level hard gate: decompose the task into confirmed subtasks, ask the task-type template's required items (with one follow-up round), present five-field plan cards, replay the requirement (facts / inferences / open items) for correction, then a fixed execute_gate click to start. The hard gate (on by default) is a tool guard that denies every non-allowlisted tool call until the user clicks go; sessions stay locked across restarts. Modes lite/standard/deep; hardGate: false for prompt-only mode.",
     "detail": "docs/DETAIL.md"
   }
 }

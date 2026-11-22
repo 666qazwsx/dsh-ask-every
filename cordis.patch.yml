@@ -2,11 +2,15 @@
     - id: ask-every
       name: 'dsh-ask-every'
       config:
+        mode: standard
         minQuestions: 1
-        maxQuestions: 6
+        maxQuestions: 10
         reaskOnSkip: true
         extraRules: ''
         gateQuestionId: execute_gate
+        decomposeFirst: true
+        clarifyRounds: 1
+        playback: gate
         dimensions:
           - "goal & scope — what exactly to make or do, and how far it must go"
           - "audience & scenario — who will use the result, in what environment"
